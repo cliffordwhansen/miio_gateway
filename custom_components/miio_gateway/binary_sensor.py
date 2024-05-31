@@ -5,7 +5,9 @@ import homeassistant.util.dt as dt_util
 from homeassistant.components.binary_sensor import (
     BinarySensorEntity, DEVICE_CLASSES)
 from homeassistant.const import STATE_OFF, STATE_ON
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.event import async_track_point_in_utc_time
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 from . import DOMAIN, CONF_DATA_DOMAIN, CONF_SENSOR_SID, CONF_SENSOR_CLASS, CONF_SENSOR_NAME, CONF_SENSOR_RESTORE, \
     EVENT_VALUES, XiaomiGwDevice
@@ -45,11 +47,15 @@ EVENT_LONG_RELEASE = "event.long_click_release"
 IGNORED_EVENTS = [EVENT_VALUES, EVENT_TILT_ANGLE, EVENT_COORDINATION]
 
 
-def setup_platform(hass, config, add_entities, discovery_info=None):
+async def async_setup_platform(
+        hass: HomeAssistant,
+        config: ConfigType,
+        async_add_entities,
+        discovery_info: DiscoveryInfoType = None):
     _LOGGER.info("Setting up binary sensors")
 
     # Make a list of all default + custom device classes
-    all_device_classes = DEVICE_CLASSES
+    all_device_classes = list(DEVICE_CLASSES)
     all_device_classes.append(DEVICE_CLASS_BUTTON)
 
     gateway = hass.data[DOMAIN]
@@ -70,21 +76,23 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
         gateway.append_known_sid(sid)
 
         if device_class in all_device_classes:
-            _LOGGER.info("Registering " + str(device_class) + " sid " + str(sid) + " as binary_sensor")
+            _LOGGER.info("Registering %s sid %s as binary_sensor", device_class, sid)
             entities.append(XiaomiGwBinarySensor(gateway, device_class, sid, name, restore))
 
     if not entities:
         _LOGGER.info("No binary_sensors configured")
         return False
 
-    add_entities(entities)
+    async_add_entities(entities)
     return True
 
 
 class XiaomiGwBinarySensor(XiaomiGwDevice, BinarySensorEntity):
+    """Representation of a Xiaomi Gateway Binary Sensor."""
 
     def __init__(self, gw, device_class, sid, name, restore):
-        XiaomiGwDevice.__init__(self, gw, "binary_sensor", device_class, sid, name, restore)
+        """Initialize the binary sensor."""
+        super().__init__(gw, "binary_sensor", device_class, sid, name, restore)
 
         # Custom Button device class
         if device_class == DEVICE_CLASS_BUTTON:
@@ -93,25 +101,28 @@ class XiaomiGwBinarySensor(XiaomiGwDevice, BinarySensorEntity):
             self._device_class = device_class
 
         self._last_action = None
-
         self._state_timer = None
 
     @property
-    def is_on(self):
-        return False if self._state == STATE_OFF else True
+    def is_on(self) -> bool:
+        """Return true if the binary sensor is on."""
+        return self._state == STATE_ON
 
     @property
-    def device_class(self):
+    def device_class(self) -> str:
+        """Return the class of this device."""
         return self._device_class
 
     @property
-    def extra_state_attributes(self):
+    def extra_state_attributes(self) -> dict:
+        """Return the state attributes."""
         attrs = super().extra_state_attributes
         if self._last_action is not None:
             attrs.update({ATTR_LAST_ACTION: self._last_action})
         return attrs
 
-    def parse_incoming_data(self, model, sid, event, params):
+    def parse_incoming_data(self, model, sid, event, params) -> bool:
+        """Parse incoming data from gateway."""
 
         # Ignore params event for this platform
         if event in IGNORED_EVENTS:
@@ -127,7 +138,7 @@ class XiaomiGwBinarySensor(XiaomiGwDevice, BinarySensorEntity):
                 'entity_id': self.entity_id,
                 'event_type': event_type
             })
-            self._state = event_type
+            self._state = STATE_ON
             self._last_action = event_type
             self._start_state_timer()
 

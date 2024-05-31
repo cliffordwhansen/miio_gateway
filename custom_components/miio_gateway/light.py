@@ -1,26 +1,44 @@
-import logging
+import asyncio
 import binascii
+import logging
 import struct
 
-from homeassistant.components.light import (
-    LightEntity, ATTR_BRIGHTNESS, ATTR_HS_COLOR, SUPPORT_BRIGHTNESS, SUPPORT_COLOR)
 import homeassistant.util.color as color_util
+from homeassistant.components.light import (
+    ATTR_BRIGHTNESS,
+    ATTR_HS_COLOR,
+    ColorMode,
+    LightEntity,
+)
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 from . import DOMAIN, XiaomiGwDevice
 
 _LOGGER = logging.getLogger(__name__)
 
-def setup_platform(hass, config, add_entities, discovery_info=None):
+
+async def async_setup_platform(
+        hass: HomeAssistant,
+        config: ConfigType,
+        async_add_entities: AddEntitiesCallback,
+        discovery_info: DiscoveryInfoType = None):
+    """Set up the light platform."""
     _LOGGER.info("Setting up light")
-    devices = []
     gateway = hass.data[DOMAIN]
-    devices.append(XiaomiGatewayLight(gateway))
-    add_entities(devices)
+    async_add_entities([XiaomiGatewayLight(gateway)])
+
 
 class XiaomiGatewayLight(XiaomiGwDevice, LightEntity):
+    """Representation of a Xiaomi Gateway Light."""
+
+    _attr_color_mode = ColorMode.BRIGHTNESS
+    _attr_supported_color_modes = {ColorMode.BRIGHTNESS}
 
     def __init__(self, gw):
-        XiaomiGwDevice.__init__(self, gw, "light", None, "miio.gateway", "Gateway LED")
+        """Initialize the light."""
+        super().__init__(gw, "light", None, "miio.gateway", "Gateway LED")
         self._hs = (0, 0)
         self._brightness = 100
         self._state = False
@@ -28,26 +46,32 @@ class XiaomiGatewayLight(XiaomiGwDevice, LightEntity):
         self.update_device_params()
 
     def update_device_params(self):
+        """Update the device parameters."""
         if self._gw.is_available():
-            self._send_to_hub({ "method": "toggle_light", "params": ["off"] })
+            asyncio.create_task(self._send_to_hub({"method": "toggle_light", "params": ["off"]}))
 
     @property
-    def is_on(self):
+    def is_on(self) -> bool:
+        """Return true if the light is on."""
         return self._state
 
     @property
-    def brightness(self):
+    def brightness(self) -> int:
+        """Return the brightness of the light."""
         return int(255 * self._brightness / 100)
 
     @property
-    def hs_color(self):
+    def hs_color(self) -> tuple:
+        """Return the hs color value."""
         return self._hs
 
     @property
-    def supported_features(self):
-        return SUPPORT_BRIGHTNESS | SUPPORT_COLOR
+    def supported_color_modes(self):
+        """Return the supported color modes."""
+        return {"hs"}
 
-    def turn_on(self, **kwargs):
+    async def async_turn_on(self, **kwargs):
+        """Turn on or control the light."""
         if ATTR_HS_COLOR in kwargs:
             self._hs = kwargs[ATTR_HS_COLOR]
         if ATTR_BRIGHTNESS in kwargs:
@@ -56,16 +80,18 @@ class XiaomiGatewayLight(XiaomiGwDevice, LightEntity):
         argb = (self._brightness,) + rgb
         argbhex = binascii.hexlify(struct.pack("BBBB", *argb)).decode("ASCII")
         argbhex = int(argbhex, 16)
-        self._send_to_hub({ "method": "set_rgb", "params": [argbhex] })
+        await self._send_to_hub({"method": "set_rgb", "params": [argbhex]})
         self._state = True
-        self.schedule_update_ha_state()
+        self.async_schedule_update_ha_state()
 
-    def turn_off(self, **kwargs):
-        self._send_to_hub({ "method": "toggle_light", "params": ["off"] })
+    async def async_turn_off(self, **kwargs):
+        """Turn off the light."""
+        await self._send_to_hub({"method": "toggle_light", "params": ["off"]})
         self._state = False
-        self.schedule_update_ha_state()
+        self.async_schedule_update_ha_state()
 
-    def parse_incoming_data(self, model, sid, event, params):
+    def parse_incoming_data(self, model, sid, event, params) -> bool:
+        """Parse incoming data from gateway."""
 
         light = params.get("light")
         if light is not None:

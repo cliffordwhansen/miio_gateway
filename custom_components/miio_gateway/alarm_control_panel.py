@@ -1,30 +1,35 @@
+import asyncio
 import logging
 
-import homeassistant.components.alarm_control_panel as alarm
-
-from . import DOMAIN, XiaomiGwDevice
-
+from homeassistant.components.alarm_control_panel import AlarmControlPanelEntity, AlarmControlPanelEntityFeature
 from homeassistant.const import (
     STATE_ALARM_ARMED_AWAY, STATE_ALARM_ARMED_HOME, STATE_ALARM_ARMED_NIGHT,
     STATE_ALARM_DISARMED, STATE_ALARM_TRIGGERED)
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
-from homeassistant.components.alarm_control_panel.const import (
-    SUPPORT_ALARM_ARM_AWAY, SUPPORT_ALARM_ARM_HOME,
-    SUPPORT_ALARM_ARM_NIGHT, SUPPORT_ALARM_TRIGGER)
+from . import DOMAIN, XiaomiGwDevice
 
 _LOGGER = logging.getLogger(__name__)
 
-def setup_platform(hass, config, add_entities, discovery_info=None):
-    _LOGGER.info("Setting up alarm")
-    devices = []
-    gateway = hass.data[DOMAIN]
-    devices.append(XiaomiGatewayAlarm(gateway))
-    add_entities(devices)
 
-class XiaomiGatewayAlarm(XiaomiGwDevice, alarm.AlarmControlPanelEntity):
+async def async_setup_platform(
+        hass: HomeAssistant,
+        config: ConfigType,
+        async_add_entities: AddEntitiesCallback,
+        discovery_info: DiscoveryInfoType = None):
+    _LOGGER.info("Setting up alarm control panel")
+    gateway = hass.data[DOMAIN]
+    async_add_entities([XiaomiGatewayAlarm(gateway)])
+
+
+class XiaomiGatewayAlarm(XiaomiGwDevice, AlarmControlPanelEntity):
+    """Representation of a Xiaomi Gateway Alarm."""
 
     def __init__(self, gw):
-        XiaomiGwDevice.__init__(self, gw, "alarm_control_panel", None, "miio.gateway", "Gateway Alarm")
+        """Initialize the alarm control panel."""
+        super().__init__(gw, "alarm_control_panel", None, "miio.gateway", "Gateway Alarm")
 
         # Default to ARMED_AWAY if no volume data was set
         self._state_by_volume = STATE_ALARM_ARMED_AWAY
@@ -36,84 +41,85 @@ class XiaomiGatewayAlarm(XiaomiGwDevice, alarm.AlarmControlPanelEntity):
         self.update_device_params()
 
     def update_device_params(self):
+        """Update the device parameters."""
         if self._gw.is_available():
-            self._send_to_hub({ "method": "get_prop", "params": ["arming"] }, self._init_set_arming)
-            self._send_to_hub({ "method": "get_prop", "params": ["alarming_volume"] }, self._init_set_volume)
+            asyncio.create_task(self._send_to_hub({"method": "get_prop", "params": ["arming"]}, self._init_set_arming))
+            asyncio.create_task(
+                self._send_to_hub({"method": "get_prop", "params": ["alarming_volume"]}, self._init_set_volume))
 
     def _init_set_arming(self, result):
         if result is not None:
-            _LOGGER.info("SETTING ARMED: " + str(result))
-            if result == "on":
-                self._state = self._state_by_volume
-            elif result == "off":
-                self._state = STATE_ALARM_DISARMED
+            _LOGGER.info("Setting armed state: %s", result)
+            self._state = self._state_by_volume if result == "on" else STATE_ALARM_DISARMED
 
     def _init_set_volume(self, result):
         if result is not None:
-            _LOGGER.info("SETTING ARMED VOL: " + str(result))
+            _LOGGER.info("Setting armed volume: %s", result)
             self._volume = int(result)
             self._state_by_volume = self._get_state_by_volume(self._volume)
             if self._is_armed():
                 self._state = self._state_by_volume
 
-    def alarm_disarm(self, code=None):
+    async def async_alarm_disarm(self, code=None):
         """Send disarm command."""
-        self._disarm()
+        await self._disarm()
         self._state = STATE_ALARM_DISARMED
-        self.schedule_update_ha_state()
+        self.async_schedule_update_ha_state()
 
-    def alarm_arm_away(self, code=None):
+    async def async_alarm_arm_away(self, code=None):
         """Send arm away command."""
         self._volume = 80
-        self._arm()
+        await self._arm()
         self._state = STATE_ALARM_ARMED_AWAY
-        self.schedule_update_ha_state()
+        self.async_schedule_update_ha_state()
 
-    def alarm_arm_home(self, code=None):
+    async def async_alarm_arm_home(self, code=None):
         """Send arm home command."""
         self._volume = 25
-        self._arm()
+        await self._arm()
         self._state = STATE_ALARM_ARMED_HOME
-        self.schedule_update_ha_state()
+        self.async_schedule_update_ha_state()
 
-    def alarm_arm_night(self, code=None):
+    async def async_alarm_arm_night(self, code=None):
         """Send arm night command."""
         self._volume = 15
-        self._arm()
+        await self._arm()
         self._state = STATE_ALARM_ARMED_NIGHT
-        self.schedule_update_ha_state()
+        self.async_schedule_update_ha_state()
 
-    def alarm_trigger(self, code=None):
+    async def async_alarm_trigger(self, code=None):
         """Trigger the alarm."""
-        self._siren()
-        self._blink()
+        await self._siren()
+        await self._blink()
         self._state = STATE_ALARM_TRIGGERED
-        self.schedule_update_ha_state()
+        self.async_schedule_update_ha_state()
 
-    def _arm(self):
-        self._send_to_hub({ "method": "set_alarming_volume", "params": [self._volume] })
-        self._send_to_hub({ "method": "set_sound_playing", "params": ["off"] })
-        self._send_to_hub({ "method": "set_arming", "params": ["on"] })
+    async def _arm(self):
+        """Arm the alarm."""
+        await self._send_to_hub({"method": "set_alarming_volume", "params": [self._volume]})
+        await self._send_to_hub({"method": "set_sound_playing", "params": ["off"]})
+        await self._send_to_hub({"method": "set_arming", "params": ["on"]})
 
-    def _disarm(self):
-        self._send_to_hub({ "method": "set_sound_playing", "params": ["off"] })
-        self._send_to_hub({ "method": "set_arming", "params": ["off"] })
+    async def _disarm(self):
+        """Disarm the alarm."""
+        await self._send_to_hub({"method": "set_sound_playing", "params": ["off"]})
+        await self._send_to_hub({"method": "set_arming", "params": ["off"]})
 
-    def _siren(self):
-        # TODO playlist
-        self._send_to_hub({ "method": "play_music_new", "params": [str(self._ringtone), self._volume] })
+    async def _siren(self):
+        """Activate the siren."""
+        await self._send_to_hub({"method": "play_music_new", "params": [str(self._ringtone), self._volume]})
 
-    def _blink(self):
-        # TODO blink
+    async def _blink(self):
+        """Activate the blink."""
         argbhex = [int("01" + self._color, 16), int("64" + self._color, 16)]
-        self._send_to_hub({ "method": "set_rgb", "params": [argbhex[1]] })
+        await self._send_to_hub({"method": "set_rgb", "params": [argbhex[1]]})
 
-    def _is_armed(self):
-        if self._state is not None or self._state != STATE_ALARM_TRIGGERED or self._state != STATE_ALARM_DISARMED:
-            return True
-        return False
+    def _is_armed(self) -> bool:
+        """Check if the alarm is armed."""
+        return self._state not in [STATE_ALARM_TRIGGERED, STATE_ALARM_DISARMED]
 
-    def _get_state_by_volume(self, volume):
+    def _get_state_by_volume(self, volume: int) -> str:
+        """Get the alarm state based on volume."""
         if volume < 20:
             return STATE_ALARM_ARMED_NIGHT
         elif volume < 30:
@@ -123,20 +129,25 @@ class XiaomiGatewayAlarm(XiaomiGwDevice, alarm.AlarmControlPanelEntity):
 
     @property
     def state(self):
+        """Return the state of the alarm control panel."""
         return self._state
 
     @property
     def supported_features(self) -> int:
-        return SUPPORT_ALARM_ARM_HOME | SUPPORT_ALARM_ARM_AWAY | SUPPORT_ALARM_ARM_NIGHT | SUPPORT_ALARM_TRIGGER
+        """Return the supported features."""
+        return (
+                AlarmControlPanelEntityFeature.ARM_AWAY
+                | AlarmControlPanelEntityFeature.ARM_HOME
+                | AlarmControlPanelEntityFeature.ARM_NIGHT
+                | AlarmControlPanelEntityFeature.TRIGGER
+        )
 
-    def parse_incoming_data(self, model, sid, event, params):
+    def parse_incoming_data(self, model, sid, event, params) -> bool:
+        """Parse incoming data from gateway."""
 
         arming = params.get("arming")
         if arming is not None:
-            if arming == "on":
-                self._state = self._get_state_by_volume(self._volume)
-            elif arming == "off":
-                self._state = STATE_ALARM_DISARMED
+            self._state = self._get_state_by_volume(self._volume) if arming == "on" else STATE_ALARM_DISARMED
             return True
 
         alarming_volume = params.get("alarming_volume")
@@ -145,6 +156,6 @@ class XiaomiGatewayAlarm(XiaomiGwDevice, alarm.AlarmControlPanelEntity):
             self._state_by_volume = self._get_state_by_volume(self._volume)
             if self._is_armed():
                 self._state = self._state_by_volume
-                return True
+            return True
 
         return False
