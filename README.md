@@ -53,6 +53,12 @@ control the gateway from Mi Home app!
   > * humidity sensors,
   > * pressure sensors.
 
+* Child diagnostic battery sensors as `sensor`.
+  > One battery sensor is created automatically for every configured child device, using restored/live voltage metadata.
+
+* Home Assistant device grouping.
+  > Built-in gateway entities are grouped under one gateway device; each configured child SID is grouped as its own HA device with binary sensor + battery entities.
+
 ## Installation of HA component
 
 1. Clone this repo as `miio_gateway` dir into `$HA_CONFIG_DIR/custom_components/`:
@@ -60,47 +66,98 @@ control the gateway from Mi Home app!
    $ cd custom_components
    $ git clone git@github.com:cadavre/miio_gateway.git ./miio_gateway
    ```
-2. Setup `$HA_CONFIG_DIR/configuration.yaml`:
+2. Restart Home Assistant.
+3. Add the integration from **Settings → Devices & Services → Add Integration** and enter:
+   * gateway IP / host,
+   * UDP port (defaults to `54321`).
+
+### YAML import for existing setups
+
+Existing `configuration.yaml` users are still supported. On startup, Home Assistant imports the YAML gateway config into a config entry.
 
 ```yaml
 miio_gateway:
-  host: 192.168.1.2    # IP of your gateway
-  port: 54321          # port running miio_client, defaults to 54321
-  sensors:             # sensors that will be available in HA (optional)
+  host: 192.168.1.2
+  port: 54321
+  sensors:
     - sid: lumi.abcd
-      class: motion                           # motion sensor
-      friendly_name: My garage motion sensor  # display name (optional)
+      class: motion
+      friendly_name: My garage motion sensor
     - sid: lumi.0123
-      class: door                             # door sensor
-      restore: true                           # will restore sensor state after HA reboot
-    - sid: lumi.ab01
-      class: button                           # button
-    - sid: lumi.smk1
-      class: smoke                            # smoke sensor
+      class: door
+      restore: true
 ```
 
-## Zibgee devices
+After import, the gateway connection is owned by the config entry and child devices can be managed from the integration UI.
+
+## Configuration model
+
+### Gateway connection
+
+The gateway itself is now configured through the UI config flow:
+
+* `host` — IP / hostname of the gateway
+* `port` — UDP port running `miio_client` (`54321` by default)
+
+### Child devices
+
+Configured child devices store:
+
+* `sid`
+* `class`
+* `friendly_name` (optional)
+* `restore` (optional)
+
+They can be added in either of two ways:
+
+1. import from existing YAML, or
+2. add them from **Settings → Devices & Services → Miio Gateway → Configure** after discovery.
+
+## Zigbee devices
 
 ### Pairing
 
-You can pair new devices without entering Mi Home app by using HA service, just call:
+You can pair new devices without entering Mi Home app by calling the HA service:
 
-```
+```text
 miio_gateway.join_zigbee
 ```
 
-service to enter pairing mode. No need to kep original `miio_client` up for 10mins after gateway reboot!
+That puts the gateway into pairing mode.
 
-### Adding sensor to HA
+### Adding a newly seen device
 
-Once you've paired new device you'll be able to see "unregistered" sensor in your HA logs.
+When an unknown child device sends an event, the integration now starts an autodiscovery flow instead of only writing a warning log.
 
-```
+The discovery dialog shows:
+
+* read-only `sid`
+* detected `model`
+* first seen `event`
+* suggested `class`
+
+You can confirm / edit:
+
+* `class`
+* `friendly_name`
+* `restore`
+
+Then Home Assistant reloads the integration and creates the new entities.
+
+If you want to manage child devices later, use:
+
+* **Configure → Add a discovered device**
+* **Configure → Remove a configured device**
+
+### Legacy log message
+
+You may still see a warning like:
+
+```text
 Received event from unregistered sensor: lumi.sensor_motion.v2 lumi.abcd - event.motion
-                                         ^ model               ^ sid       ^ event that was sent
 ```
 
-Use SID to define it in `sensors:` section of `configuration.yaml`.
+That still means the child device is not configured yet, but it should now also appear as an autodiscovery prompt in Home Assistant.
 
 ### Using Zigbee button
 
@@ -140,6 +197,33 @@ Just like `button` – vibration sensor sends one of two events:
 * `bed_activity` on... bed activity? :D
 
 You can use them just like with buttons. Event type is still `event_type: miio_gateway.action`.
+
+## Devices and entities in Home Assistant
+
+Once configured, Home Assistant shows:
+
+* one **Miio Gateway** device containing:
+  * `light.miio_gateway`
+  * `media_player.miio_gateway`
+  * `sensor.miio_gateway_illuminance`
+  * `alarm_control_panel.miio_gateway`
+* one HA device per configured child SID
+  * the main child entity (for example `binary_sensor.*_motion` or `binary_sensor.*_button`)
+  * an automatic battery sensor such as `sensor.*_battery`
+
+Battery sensors are diagnostic entities derived from voltage metadata. They remain separate from the raw `voltage` attribute so battery level can be used directly in the UI, dashboards, and automations.
+
+## Migration notes
+
+If you used older YAML-only versions of this integration:
+
+* gateway setup now prefers the UI config entry,
+* YAML gateway config is imported automatically,
+* child devices can now be added/removed from the integration UI,
+* unknown devices can appear through autodiscovery,
+* each configured child device now also gets a battery entity.
+
+If existing entities were created before the config-entry migration, Home Assistant may need a restart or entity/device registry cleanup before device grouping looks fully correct.
 
 ## Alarm finetuning
 

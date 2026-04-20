@@ -1,0 +1,69 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Miio Gateway",
+        "description": "Enter the connection details for your Xiaomi Miio Gateway (lumi.gateway.mieu01).",
+        "data": {
+          "host": "IP Address",
+          "port": "Port"
+        }
+      },
+      "confirm_discovery": {
+        "title": "Add Discovered Miio Device",
+        "description": "A new child device was discovered for this gateway.\n\nDevice SID (read-only): `{sid}`\nModel: `{model}`\nFirst event: `{event}`",
+        "data": {
+          "class": "Device Class (e.g. motion, button, door, leak)",
+          "friendly_name": "Friendly Name (optional)",
+          "restore": "Restore state on restart"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "This gateway is already configured.",
+      "yaml_only": "This integration can only be set up via the UI or configuration.yaml.",
+      "already_configured_device": "This child device is already configured.",
+      "device_added": "The discovered device has been added."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Miio Gateway",
+        "menu_options": {
+          "add_discovered_device": "Add a discovered device",
+          "remove_configured_device": "Remove a configured device"
+        }
+      },
+      "add_discovered_device": {
+        "title": "Add Discovered Device",
+        "description": "The following devices have been seen by the gateway but are not yet configured.",
+        "data": {
+          "sid": "Device SID"
+        }
+      },
+      "configure_discovered_device": {
+        "title": "Configure New Device",
+        "description": "Device SID (read-only): `{sid}`\nModel: `{model}`\nFirst event: `{event}`",
+        "data": {
+          "class": "Device Class (e.g. motion, button, door, leak)",
+          "friendly_name": "Friendly Name (optional)",
+          "restore": "Restore state on restart"
+        }
+      },
+      "remove_configured_device": {
+        "title": "Remove Configured Device",
+        "description": "Select a configured device to remove. This will remove its entities after a reload.",
+        "data": {
+          "sid": "Device"
+        }
+      }
+    },
+    "abort": {
+      "no_discovered_devices": "No new undiscovered devices have been seen yet. Trigger an action on the device first.",
+      "no_configured_devices": "No configured child devices to remove.",
+      "device_not_found": "Selected device could not be found."
+    }
+  }
+}
+

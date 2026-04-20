@@ -3,24 +3,27 @@ import binascii
 import struct
 
 from homeassistant.components.light import (
-    LightEntity, ATTR_BRIGHTNESS, ATTR_HS_COLOR, SUPPORT_BRIGHTNESS, SUPPORT_COLOR)
+    ATTR_BRIGHTNESS, ATTR_HS_COLOR, ColorMode, LightEntity)
 import homeassistant.util.color as color_util
 
-from . import DOMAIN, XiaomiGwDevice
+from . import DOMAIN, ENTRY_DATA_GATEWAY, XiaomiGwDevice
 
 _LOGGER = logging.getLogger(__name__)
 
-def setup_platform(hass, config, add_entities, discovery_info=None):
-    _LOGGER.info("Setting up light")
-    devices = []
+async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
     gateway = hass.data[DOMAIN]
-    devices.append(XiaomiGatewayLight(gateway))
-    add_entities(devices)
+    async_add_entities([XiaomiGatewayLight(gateway)])
+
+
+async def async_setup_entry(hass, entry, async_add_entities):
+    gateway = hass.data[DOMAIN][entry.entry_id][ENTRY_DATA_GATEWAY]
+    async_add_entities([XiaomiGatewayLight(gateway)])
 
 class XiaomiGatewayLight(XiaomiGwDevice, LightEntity):
 
     def __init__(self, gw):
         XiaomiGwDevice.__init__(self, gw, "light", None, "miio.gateway", "Gateway LED")
+        self._attr_supported_color_modes = {ColorMode.HS}
         self._hs = (0, 0)
         self._brightness = 100
         self._state = False
@@ -44,10 +47,10 @@ class XiaomiGatewayLight(XiaomiGwDevice, LightEntity):
         return self._hs
 
     @property
-    def supported_features(self):
-        return SUPPORT_BRIGHTNESS | SUPPORT_COLOR
+    def color_mode(self):
+        return ColorMode.HS
 
-    def turn_on(self, **kwargs):
+    async def async_turn_on(self, **kwargs):
         if ATTR_HS_COLOR in kwargs:
             self._hs = kwargs[ATTR_HS_COLOR]
         if ATTR_BRIGHTNESS in kwargs:
@@ -58,12 +61,12 @@ class XiaomiGatewayLight(XiaomiGwDevice, LightEntity):
         argbhex = int(argbhex, 16)
         self._send_to_hub({ "method": "set_rgb", "params": [argbhex] })
         self._state = True
-        self.schedule_update_ha_state()
+        self.async_write_ha_state()
 
-    def turn_off(self, **kwargs):
+    async def async_turn_off(self, **kwargs):
         self._send_to_hub({ "method": "toggle_light", "params": ["off"] })
         self._state = False
-        self.schedule_update_ha_state()
+        self.async_write_ha_state()
 
     def parse_incoming_data(self, model, sid, event, params):
 

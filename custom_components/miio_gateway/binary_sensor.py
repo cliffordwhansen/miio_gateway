@@ -2,13 +2,13 @@ import logging
 from datetime import timedelta
 
 import homeassistant.util.dt as dt_util
-from homeassistant.components.binary_sensor import (
-    BinarySensorEntity, DEVICE_CLASSES)
+from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.const import STATE_OFF, STATE_ON
+from homeassistant.core import callback
 from homeassistant.helpers.event import async_track_point_in_utc_time
 
 from . import DOMAIN, CONF_DATA_DOMAIN, CONF_SENSOR_SID, CONF_SENSOR_CLASS, CONF_SENSOR_NAME, CONF_SENSOR_RESTORE, \
-    EVENT_VALUES, XiaomiGwDevice
+    ENTRY_DATA_GATEWAY, ENTRY_DATA_SENSORS, EVENT_VALUES, XiaomiGwDevice
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -43,19 +43,29 @@ EVENT_LONG_PRESS = "event.long_click_press"
 EVENT_LONG_RELEASE = "event.long_click_release"
 
 IGNORED_EVENTS = [EVENT_VALUES, EVENT_TILT_ANGLE, EVENT_COORDINATION]
+NON_BINARY_SENSOR_CLASSES = {"illuminance", "temperature", "humidity", "pressure"}
 
 
-def setup_platform(hass, config, add_entities, discovery_info=None):
-    _LOGGER.info("Setting up binary sensors")
-
-    # Make a list of all default + custom device classes
-    all_device_classes = DEVICE_CLASSES
-    all_device_classes.append(DEVICE_CLASS_BUTTON)
-
+async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
     gateway = hass.data[DOMAIN]
+    sensor_configs = hass.data[CONF_DATA_DOMAIN]
+    await _async_add_binary_sensor_entities(gateway, sensor_configs, async_add_entities)
+
+
+async def async_setup_entry(hass, entry, async_add_entities):
+    entry_data = hass.data[DOMAIN][entry.entry_id]
+    await _async_add_binary_sensor_entities(
+        entry_data[ENTRY_DATA_GATEWAY],
+        entry_data[ENTRY_DATA_SENSORS],
+        async_add_entities,
+    )
+
+
+async def _async_add_binary_sensor_entities(gateway, sensor_configs, async_add_entities):
+    _LOGGER.info("Setting up binary sensors")
     entities = []
 
-    for cfg in hass.data[CONF_DATA_DOMAIN]:
+    for cfg in sensor_configs:
         if not cfg:
             cfg = {}
 
@@ -67,17 +77,19 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
         if sid is None or device_class is None:
             continue
 
+        if device_class in NON_BINARY_SENSOR_CLASSES:
+            continue
+
         gateway.append_known_sid(sid)
 
-        if device_class in all_device_classes:
-            _LOGGER.info("Registering " + str(device_class) + " sid " + str(sid) + " as binary_sensor")
-            entities.append(XiaomiGwBinarySensor(gateway, device_class, sid, name, restore))
+        _LOGGER.info("Registering " + str(device_class) + " sid " + str(sid) + " as binary_sensor")
+        entities.append(XiaomiGwBinarySensor(gateway, device_class, sid, name, restore))
 
     if not entities:
         _LOGGER.info("No binary_sensors configured")
         return False
 
-    add_entities(entities)
+    async_add_entities(entities)
     return True
 
 
@@ -85,6 +97,7 @@ class XiaomiGwBinarySensor(XiaomiGwDevice, BinarySensorEntity):
 
     def __init__(self, gw, device_class, sid, name, restore):
         XiaomiGwDevice.__init__(self, gw, "binary_sensor", device_class, sid, name, restore)
+        self._state = STATE_OFF
 
         # Custom Button device class
         if device_class == DEVICE_CLASS_BUTTON:
@@ -98,7 +111,7 @@ class XiaomiGwBinarySensor(XiaomiGwDevice, BinarySensorEntity):
 
     @property
     def is_on(self):
-        return False if self._state == STATE_OFF else True
+        return self._state not in (None, STATE_OFF)
 
     @property
     def device_class(self):
@@ -123,7 +136,7 @@ class XiaomiGwBinarySensor(XiaomiGwDevice, BinarySensorEntity):
             self._state = STATE_OFF
         else:
             event_type = event.split(".")[1]
-            self._gw.hass.bus.fire('miio_gateway.action', {
+            self._gw.hass.bus.async_fire('miio_gateway.action', {
                 'entity_id': self.entity_id,
                 'event_type': event_type
             })
@@ -141,8 +154,9 @@ class XiaomiGwBinarySensor(XiaomiGwDevice, BinarySensorEntity):
         restore_state_time = dt_util.utcnow() + timedelta(seconds=15)
         self._state_timer = async_track_point_in_utc_time(self.hass, self._stop_state_timer, restore_state_time)
 
+    @callback
     def _stop_state_timer(self, time):
         """Stop state timer."""
         self._state_timer = None
         self._state = STATE_OFF
-        self.schedule_update_ha_state()
+        self.async_write_ha_state()

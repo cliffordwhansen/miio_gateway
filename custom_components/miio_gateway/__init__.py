@@ -1,22 +1,20 @@
 import json
 import logging
 import socket
-from time import sleep
+from queue import Queue
 from threading import Thread
-from multiprocessing import Queue
 from datetime import timedelta
 
 import voluptuous as vol
 
-from homeassistant.const import (
-    CONF_HOST, CONF_MAC, CONF_PORT,
-    EVENT_HOMEASSISTANT_STOP)
+from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 
 from homeassistant.core import callback
-from homeassistant.helpers import discovery
+from homeassistant.helpers.device_registry import DeviceInfo
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.restore_state import RestoreEntity
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.util.dt import utcnow
 
 _LOGGER = logging.getLogger(__name__)
@@ -25,6 +23,10 @@ TIME_INTERVAL_PING = timedelta(minutes=1)
 
 DOMAIN = "miio_gateway"
 CONF_DATA_DOMAIN = "miio_gateway_config"
+PLATFORMS = ["light", "media_player", "binary_sensor", "sensor", "alarm_control_panel"]
+ENTRY_DATA_GATEWAY = "gateway"
+ENTRY_DATA_SENSORS = "sensors"
+ENTRY_DATA_DISCOVERED = "discovered_devices"
 
 CONF_HOST = "host"
 CONF_PORT = "port"
@@ -55,46 +57,94 @@ CONFIG_SCHEMA = vol.Schema({
     DOMAIN: vol.Schema({
         vol.Required(CONF_HOST): cv.string,
         vol.Optional(CONF_PORT, default=54321): cv.port,
-        vol.Optional(CONF_SENSORS, default={}): vol.Any(cv.ensure_list, [SENSORS_CONFIG_SCHEMA]),
+        vol.Optional(CONF_SENSORS, default=[]): vol.All(cv.ensure_list, [SENSORS_CONFIG_SCHEMA]),
     })
 }, extra=vol.ALLOW_EXTRA)
 
 SERVICE_JOIN_ZIGBEE = "join_zigbee"
 SERVICE_SCHEMA = vol.Schema({})
 
-def setup(hass, config):
+async def async_setup(hass, config):
     """Setup gateway from config."""
+    hass.data.setdefault(DOMAIN, {})
+
+    async def join_zigbee_service_handler(service):
+        for entry_data in hass.data.get(DOMAIN, {}).values():
+            gateway = entry_data.get(ENTRY_DATA_GATEWAY)
+            if gateway is not None:
+                gateway.send_to_hub({"method": "start_zigbee_join"})
+                return
+        _LOGGER.warning("join_zigbee requested but no miio_gateway instance is loaded")
+
+    if not hass.services.has_service(DOMAIN, SERVICE_JOIN_ZIGBEE):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_JOIN_ZIGBEE,
+            join_zigbee_service_handler,
+            schema=SERVICE_SCHEMA,
+        )
+
+    if DOMAIN not in config:
+        return True
+
     _LOGGER.info("Starting gateway setup...")
 
-    # Gateway starts it's action on object init.
-    gateway = XiaomiGw(hass, config[DOMAIN][CONF_HOST], config[DOMAIN][CONF_PORT])
-
-    # Gentle stop on HASS stop.
-    hass.bus.listen_once(EVENT_HOMEASSISTANT_STOP, gateway.gently_stop)
-
-    # Share the config to platform's components.
-    hass.data[DOMAIN] = gateway
-    hass.data[CONF_DATA_DOMAIN] = config[DOMAIN].get(CONF_SENSORS)
-
-    # Load components.
-    for component in ["light", "media_player", "binary_sensor", "sensor", "alarm_control_panel"]:
-        discovery.load_platform(hass, component, DOMAIN, {}, config)
-
-    # Zigbee join HASS service helper.
-    def join_zigbee_service_handler(service):
-        gateway = hass.data[DOMAIN]
-        gateway.send_to_hub({ "method": "start_zigbee_join" })
-    hass.services.register(
-        DOMAIN, SERVICE_JOIN_ZIGBEE, join_zigbee_service_handler,
-        schema=SERVICE_SCHEMA)
+    hass.async_create_task(
+        hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_IMPORT},
+            data=config[DOMAIN],
+        )
+    )
 
     return True
+
+
+async def async_reload_entry(hass, entry: ConfigEntry):
+    """Reload miio_gateway when config entry data/options change."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+def get_configured_sensors(entry: ConfigEntry):
+    """Return configured child sensors from options or entry data."""
+    return entry.options.get(CONF_SENSORS, entry.data.get(CONF_SENSORS, []))
+
+
+async def async_setup_entry(hass, entry: ConfigEntry):
+    """Set up miio_gateway from a config entry imported from YAML."""
+    gateway = await hass.async_add_executor_job(
+        XiaomiGw, hass, entry.entry_id, entry.data[CONF_HOST], entry.data[CONF_PORT]
+    )
+
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, gateway.gently_stop)
+    entry.async_on_unload(entry.add_update_listener(async_reload_entry))
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
+        ENTRY_DATA_GATEWAY: gateway,
+        ENTRY_DATA_SENSORS: get_configured_sensors(entry),
+        ENTRY_DATA_DISCOVERED: {},
+    }
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    return True
+
+
+async def async_unload_entry(hass, entry: ConfigEntry):
+    """Unload a miio_gateway config entry."""
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unload_ok:
+        entry_data = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+        if entry_data is not None:
+            gateway = entry_data.get(ENTRY_DATA_GATEWAY)
+            if gateway is not None:
+                await hass.async_add_executor_job(gateway.gently_stop)
+    return unload_ok
 
 class XiaomiGw:
     """Gateway socket and communication layer."""
 
-    def __init__(self, hass, host, port):
+    def __init__(self, hass, entry_id, host, port):
         self.hass = hass
+        self._entry_id = entry_id
 
         self._host = host
         self._port = port
@@ -113,8 +163,8 @@ class XiaomiGw:
         self._availability_pinger = None
         self._pings_sent = 0
 
-        self._known_sids = []
-        self._known_sids.append("miio.gateway") # Append self.
+        self._known_sids = {"miio.gateway"}  # Append self.
+        self._discovered_unknown_devices = set()
 
         import hashlib, base64
         self._unique_id = base64.urlsafe_b64encode(hashlib.sha1((self._host + ":" + str(self._port)).encode("utf-8")).digest())[:10].decode("utf-8")
@@ -134,6 +184,9 @@ class XiaomiGw:
 
     def gently_stop(self, event=None):
         """Stops listener and closes socket."""
+        if self._availability_pinger is not None:
+            self._availability_pinger()
+            self._availability_pinger = None
         self._stop_listening()
         self._close_socket()
 
@@ -149,7 +202,58 @@ class XiaomiGw:
         self._callbacks.append(callback)
 
     def append_known_sid(self, sid):
-        self._known_sids.append(sid)
+        self._known_sids.add(sid)
+
+    def _dispatch_callback(self, func, *args):
+        """Run gateway callbacks on the Home Assistant event loop."""
+        self.hass.loop.call_soon_threadsafe(func, *args)
+
+    @callback
+    def _start_discovered_device_flow(self, model, sid, event):
+        """Launch a config flow for a newly seen unregistered child device."""
+        suggested_class = self._suggest_sensor_class(model, event)
+        entry_data = self.hass.data.get(DOMAIN, {}).get(self._entry_id)
+        if entry_data is not None:
+            entry_data[ENTRY_DATA_DISCOVERED][sid] = {
+                ATTR_MODEL: model,
+                "event": event,
+                CONF_SENSOR_CLASS: suggested_class,
+            }
+
+        self.hass.async_create_task(
+            self.hass.config_entries.flow.async_init(
+                DOMAIN,
+                context={"source": "integration_discovery"},
+                data={
+                    "entry_id": self._entry_id,
+                    CONF_SENSOR_SID: sid,
+                    ATTR_MODEL: model,
+                    "event": event,
+                    CONF_SENSOR_CLASS: suggested_class,
+                },
+            )
+        )
+
+    def _suggest_sensor_class(self, model, event):
+        """Best-effort guess for the YAML class of a discovered device."""
+        model = (model or "").lower()
+        event = (event or "").lower()
+
+        if "motion" in model or event == "event.motion":
+            return "motion"
+        if "magnet" in model:
+            return "door"
+        if "switch" in model or "button" in model or event.startswith("event.click"):
+            return "button"
+        if "weather" in model:
+            return "temperature"
+        if "leak" in model:
+            return "leak"
+        if "smoke" in model:
+            return "smoke"
+        if "vibration" in model:
+            return "vibration"
+        return None
 
     """Private."""
 
@@ -195,7 +299,7 @@ class XiaomiGw:
         """Create thread for loop."""
         _LOGGER.debug("Starting thread...")
         self._thread = Thread(target=self._run_socket_thread, args=())
-        #self._thread.daemon = True
+        self._thread.daemon = True
         self._thread.start()
         _LOGGER.debug("Starting availability tracker...")
         self._track_availability()
@@ -204,7 +308,8 @@ class XiaomiGw:
         """Remove loop thread."""
         _LOGGER.debug("Exiting thread...")
         self._thread_alive = False
-        self._thread.join()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join()
 
     def _run_socket_thread(self):
         """Thread loop task."""
@@ -214,7 +319,7 @@ class XiaomiGw:
 
             if self._socket is None:
                 _LOGGER.error("No socket in listener!")
-                self.create_socket()
+                self._create_socket()
                 continue
 
             try:
@@ -251,6 +356,8 @@ class XiaomiGw:
     def _track_availability(self):
         """Check pings status and schedule next availability check."""
         _LOGGER.debug("Starting to track availability...")
+        if self._availability_pinger is not None:
+            self._availability_pinger()
         # Schedule pings every TIME_INTERVAL_PING.
         self._availability_pinger = async_track_time_interval(
             self.hass, self._ping, TIME_INTERVAL_PING)
@@ -268,16 +375,20 @@ class XiaomiGw:
         if availability_changed:
             _LOGGER.info("Gateway availability changed! Available: " + str(available))
             for func in self._callbacks:
-                func(None, None, EVENT_AVAILABILITY)
+                self._dispatch_callback(func, None, None, EVENT_AVAILABILITY)
 
     @callback
     def _ping(self, event=None):
         """Queue ping to keep and check connection."""
         self._pings_sent = self._pings_sent + 1
         self.send_to_hub({"method": "internal.PING"})
-        sleep(6) # Give it `timeout` time to respond...
-        if self._pings_sent >= 3:
-            self._set_availability(False)
+
+        @callback
+        def _mark_unavailable(_now):
+            if self._pings_sent >= 3:
+                self._set_availability(False)
+
+        async_call_later(self.hass, 6, _mark_unavailable)
 
     """Miio gateway protocol parsing."""
 
@@ -299,7 +410,8 @@ class XiaomiGw:
                             result = "unknown"
                         else:
                             result = result[0]
-                    self._result_callbacks[miio_id](result)
+                    callback = self._result_callbacks.pop(miio_id)
+                    self._dispatch_callback(callback, result)
 
             elif "method" in res:
                 """Handling new data received."""
@@ -351,7 +463,7 @@ class XiaomiGw:
 
                 # Now we have all the data we need
                 for func in self._callbacks:
-                    func(model, sid, event, params)
+                    self._dispatch_callback(func, model, sid, event, params)
 
             else:
                 """Nothing that we can handle."""
@@ -362,6 +474,15 @@ class XiaomiGw:
         _LOGGER.debug("Received event: " + str(model) + " " + str(sid) + " - " + str(event))
         if sid not in self._known_sids:
             _LOGGER.warning("Received event from unregistered sensor: " + str(model) + " " + str(sid) + " - " + str(event))
+            device_key = (model, sid)
+            if device_key not in self._discovered_unknown_devices:
+                self._discovered_unknown_devices.add(device_key)
+                self.hass.loop.call_soon_threadsafe(
+                    self._start_discovered_device_flow,
+                    model,
+                    sid,
+                    event,
+                )
 
     """Miio."""
 
@@ -400,7 +521,9 @@ class XiaomiGw:
 class XiaomiGwDevice(RestoreEntity):
     """A generic device of Gateway."""
 
-    def __init__(self, gw, platform, device_class = None, sid = None, name = None, restore = None):
+    _attr_should_poll = False
+
+    def __init__(self, gw, platform, device_class = None, sid = None, name = None, restore = None, device_name = None):
         """Initialize the device."""
 
         self._gw = gw
@@ -410,6 +533,7 @@ class XiaomiGwDevice(RestoreEntity):
         self._restore = restore
         self._sid = sid
         self._name = name
+        self._device_name = device_name or name
 
         self._model = None
         self._voltage = None
@@ -426,10 +550,18 @@ class XiaomiGwDevice(RestoreEntity):
     async def async_added_to_hass(self):
         """Add push data listener for this device."""
         self._gw.append_callback(self._add_push_data_job)
-        if self._restore:
-            state = await self.async_get_last_state()
-            if state is not None:
+        state = await self.async_get_last_state()
+        if state is not None:
+            if self._restore:
                 self._state = state.state
+
+            attributes = state.attributes
+            if attributes.get(ATTR_VOLTAGE) is not None:
+                self._voltage = attributes.get(ATTR_VOLTAGE)
+            if attributes.get(ATTR_LQI) is not None:
+                self._lqi = attributes.get(ATTR_LQI)
+            if attributes.get(ATTR_MODEL) is not None:
+                self._model = attributes.get(ATTR_MODEL)
 
     @property
     def name(self):
@@ -444,8 +576,23 @@ class XiaomiGwDevice(RestoreEntity):
         return self._gw.is_available()
 
     @property
-    def should_poll(self):
-        return False
+    def device_info(self) -> DeviceInfo:
+        """Return device grouping info for the HA device registry."""
+        if self._sid == "miio.gateway":
+            return DeviceInfo(
+                identifiers={(DOMAIN, self._gw.unique_id())},
+                name="Miio Gateway",
+                manufacturer="Xiaomi",
+                model="lumi.gateway.mieu01",
+            )
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._sid)},
+            name=self._device_name or self._sid.replace(".", "_"),
+            manufacturer="Xiaomi / Aqara",
+            model=self._model,
+            via_device=(DOMAIN, self._gw.unique_id()),
+        )
+
 
     @property
     def extra_state_attributes(self):
