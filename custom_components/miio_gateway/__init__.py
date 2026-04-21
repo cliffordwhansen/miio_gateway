@@ -1,6 +1,7 @@
 import json
 import logging
 import socket
+from collections import defaultdict
 from queue import Queue
 from threading import Thread
 from datetime import timedelta
@@ -156,7 +157,8 @@ class XiaomiGw:
         self._send_queue = Queue(maxsize=25)
         self._miio_id = 0
 
-        self._callbacks = []
+        self._callbacks = set()
+        self._sid_callbacks = defaultdict(set)
         self._result_callbacks = {}
 
         self._available = None
@@ -194,12 +196,28 @@ class XiaomiGw:
         """Send data to hub."""
         miio_id, data = self._miio_msg_encode(data)
         if callback is not None:
-            _LOGGER.info("Adding callback for call ID: " + str(miio_id))
+            _LOGGER.debug("Adding callback for call ID: %s", miio_id)
             self._result_callbacks[miio_id] = callback
         self._send_queue.put(data)
 
-    def append_callback(self, callback):
-        self._callbacks.append(callback)
+    def append_callback(self, callback, sid=None):
+        if sid is None:
+            self._callbacks.add(callback)
+        else:
+            self._sid_callbacks[sid].add(callback)
+
+    def remove_callback(self, callback, sid=None):
+        if sid is None:
+            self._callbacks.discard(callback)
+            return
+
+        sid_callbacks = self._sid_callbacks.get(sid)
+        if sid_callbacks is None:
+            return
+
+        sid_callbacks.discard(callback)
+        if not sid_callbacks:
+            self._sid_callbacks.pop(sid, None)
 
     def append_known_sid(self, sid):
         self._known_sids.add(sid)
@@ -207,6 +225,24 @@ class XiaomiGw:
     def _dispatch_callback(self, func, *args):
         """Run gateway callbacks on the Home Assistant event loop."""
         self.hass.loop.call_soon_threadsafe(func, *args)
+
+    def _dispatch_callbacks_for_sid(self, sid, *args):
+        """Run only callbacks interested in a specific sid."""
+        callbacks = tuple(self._callbacks)
+        if sid is not None:
+            callbacks += tuple(self._sid_callbacks.get(sid, ()))
+
+        for func in callbacks:
+            self._dispatch_callback(func, *args)
+
+    def _dispatch_all_callbacks(self, *args):
+        """Run all registered callbacks."""
+        callbacks = set(self._callbacks)
+        for sid_callbacks in self._sid_callbacks.values():
+            callbacks.update(sid_callbacks)
+
+        for func in callbacks:
+            self._dispatch_callback(func, *args)
 
     @callback
     def _start_discovered_device_flow(self, model, sid, event):
@@ -223,7 +259,13 @@ class XiaomiGw:
         self.hass.async_create_task(
             self.hass.config_entries.flow.async_init(
                 DOMAIN,
-                context={"source": "integration_discovery"},
+                context={
+                    "source": "integration_discovery",
+                    "title_placeholders": {
+                        "model": model or "Unknown device",
+                        "sid": sid,
+                    },
+                },
                 data={
                     "entry_id": self._entry_id,
                     CONF_SENSOR_SID: sid,
@@ -374,8 +416,7 @@ class XiaomiGw:
 
         if availability_changed:
             _LOGGER.info("Gateway availability changed! Available: " + str(available))
-            for func in self._callbacks:
-                self._dispatch_callback(func, None, None, EVENT_AVAILABILITY)
+            self._dispatch_all_callbacks(None, None, EVENT_AVAILABILITY)
 
     @callback
     def _ping(self, event=None):
@@ -458,12 +499,11 @@ class XiaomiGw:
                     event = EVENT_VALUES
                 else:
                     """Unknown method."""
-                    _LOGGER.info("Received unknown method: " + str(method))
+                    _LOGGER.debug("Received unknown method: %s", method)
                     continue
 
                 # Now we have all the data we need
-                for func in self._callbacks:
-                    self._dispatch_callback(func, model, sid, event, params)
+                self._dispatch_callbacks_for_sid(sid, model, sid, event, params)
 
             else:
                 """Nothing that we can handle."""
@@ -549,7 +589,7 @@ class XiaomiGwDevice(RestoreEntity):
 
     async def async_added_to_hass(self):
         """Add push data listener for this device."""
-        self._gw.append_callback(self._add_push_data_job)
+        self._gw.append_callback(self._push_data, self._sid)
         state = await self.async_get_last_state()
         if state is not None:
             if self._restore:
@@ -562,6 +602,10 @@ class XiaomiGwDevice(RestoreEntity):
                 self._lqi = attributes.get(ATTR_LQI)
             if attributes.get(ATTR_MODEL) is not None:
                 self._model = attributes.get(ATTR_MODEL)
+
+    async def async_will_remove_from_hass(self):
+        """Remove push data listener for this device."""
+        self._gw.remove_callback(self._push_data, self._sid)
 
     @property
     def name(self):
@@ -599,8 +643,6 @@ class XiaomiGwDevice(RestoreEntity):
         attrs = { ATTR_VOLTAGE: self._voltage, ATTR_LQI: self._lqi, ATTR_MODEL: self._model, ATTR_ALIVE: self._alive }
         return attrs
 
-    def _add_push_data_job(self, *args):
-        self.hass.add_job(self._push_data, *args)
 
     @callback
     def _push_data(self, model = None, sid = None, event = None, params = {}):
@@ -609,17 +651,15 @@ class XiaomiGwDevice(RestoreEntity):
         # If should/need get into real parsing
         init_parse = self._pre_parse_data(model, sid, event, params)
         if init_parse is not None:
-            # Update HA state
-            if init_parse == True:
-                self.async_schedule_update_ha_state()
+            # Update HA state only if data changed
+            if init_parse is True:
+                self.async_write_ha_state()
             return
 
         # If parsed some data
         has_data = self.parse_incoming_data(model, sid, event, params)
         if has_data:
-            # Update HA state
-            self.async_schedule_update_ha_state()
-            return
+            self.async_write_ha_state()
 
     def parse_incoming_data(self, model, sid, event, params):
         """Parse incoming data from gateway. Abstract."""
@@ -647,16 +687,20 @@ class XiaomiGwDevice(RestoreEntity):
         # Generic handler for event.keepalive
         if event == EVENT_KEEPALIVE:
             self._alive = utcnow()
-            return True
+            # Keepalive only updates the heartbeat timestamp — no state write needed.
+            return False
 
-        # Generic handler for _otg.log
+        # Generic handler for _otc.log
         if event == EVENT_METADATA:
             zigbeeData = params.get("subdev_zigbee")
             if zigbeeData is not None:
-                self._voltage = zigbeeData.get("voltage")
-                self._lqi = zigbeeData.get("lqi")
-                _LOGGER.info("Vol:" + str(self._voltage) + " lqi:" + str(self._lqi))
-                return True
+                new_voltage = zigbeeData.get("voltage")
+                new_lqi = zigbeeData.get("lqi")
+                changed = new_voltage != self._voltage or new_lqi != self._lqi
+                self._voltage = new_voltage
+                self._lqi = new_lqi
+                _LOGGER.debug("Vol:%s lqi:%s", self._voltage, self._lqi)
+                return changed
             return False
 
         return None

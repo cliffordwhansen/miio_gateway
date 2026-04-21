@@ -50,7 +50,7 @@ class XiaomiGatewayMediaPlayer(XiaomiGwDevice, MediaPlayerEntity):
 
     def _init_set_volume(self, result):
         if result is not None:
-            _LOGGER.info("SETTING VOL: " + str(result))
+            _LOGGER.debug("SETTING VOL: %s", result)
             self._volume = int(result) / 100
 
     async def async_set_volume_level(self, volume):
