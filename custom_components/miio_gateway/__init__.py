@@ -32,6 +32,7 @@ ENTRY_DATA_DISCOVERED = "discovered_devices"
 CONF_HOST = "host"
 CONF_PORT = "port"
 CONF_SENSORS = "sensors"
+CONF_IGNORED_SIDS = "ignored_sids"
 CONF_SENSOR_SID = "sid"
 CONF_SENSOR_CLASS = "class"
 CONF_SENSOR_NAME = "friendly_name"
@@ -111,10 +112,16 @@ def get_configured_sensors(entry: ConfigEntry):
     return entry.options.get(CONF_SENSORS, entry.data.get(CONF_SENSORS, []))
 
 
+def get_ignored_sids(entry: ConfigEntry):
+    """Return ignored child device SIDs from entry options."""
+    return entry.options.get(CONF_IGNORED_SIDS, [])
+
+
 async def async_setup_entry(hass, entry: ConfigEntry):
     """Set up miio_gateway from a config entry imported from YAML."""
+    ignored_sids = set(get_ignored_sids(entry))
     gateway = await hass.async_add_executor_job(
-        XiaomiGw, hass, entry.entry_id, entry.data[CONF_HOST], entry.data[CONF_PORT]
+        XiaomiGw, hass, entry.entry_id, entry.data[CONF_HOST], entry.data[CONF_PORT], ignored_sids
     )
 
     hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, gateway.gently_stop)
@@ -143,7 +150,7 @@ async def async_unload_entry(hass, entry: ConfigEntry):
 class XiaomiGw:
     """Gateway socket and communication layer."""
 
-    def __init__(self, hass, entry_id, host, port):
+    def __init__(self, hass, entry_id, host, port, ignored_sids=None):
         self.hass = hass
         self._entry_id = entry_id
 
@@ -166,6 +173,7 @@ class XiaomiGw:
         self._pings_sent = 0
 
         self._known_sids = {"miio.gateway"}  # Append self.
+        self._ignored_sids = set(ignored_sids or ())
         self._discovered_unknown_devices = set()
 
         import hashlib, base64
@@ -222,6 +230,9 @@ class XiaomiGw:
     def append_known_sid(self, sid):
         self._known_sids.add(sid)
 
+    def append_ignored_sid(self, sid):
+        self._ignored_sids.add(sid)
+
     def _dispatch_callback(self, func, *args):
         """Run gateway callbacks on the Home Assistant event loop."""
         self.hass.loop.call_soon_threadsafe(func, *args)
@@ -247,6 +258,9 @@ class XiaomiGw:
     @callback
     def _start_discovered_device_flow(self, model, sid, event):
         """Launch a config flow for a newly seen unregistered child device."""
+        if sid in self._known_sids or sid in self._ignored_sids:
+            return
+
         suggested_class = self._suggest_sensor_class(model, event)
         entry_data = self.hass.data.get(DOMAIN, {}).get(self._entry_id)
         if entry_data is not None:
@@ -512,6 +526,10 @@ class XiaomiGw:
     def _event_received(self, model, sid, event):
         """Callback for receiving sensor event from gateway."""
         _LOGGER.debug("Received event: " + str(model) + " " + str(sid) + " - " + str(event))
+        if sid in self._ignored_sids:
+            _LOGGER.debug("Ignoring event from ignored sensor: %s %s - %s", model, sid, event)
+            return
+
         if sid not in self._known_sids:
             _LOGGER.warning("Received event from unregistered sensor: " + str(model) + " " + str(sid) + " - " + str(event))
             device_key = (model, sid)

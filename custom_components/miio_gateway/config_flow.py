@@ -5,6 +5,7 @@ import voluptuous as vol
 
 from . import (
     CONF_HOST,
+    CONF_IGNORED_SIDS,
     CONF_PORT,
     CONF_SENSOR_CLASS,
     CONF_SENSOR_NAME,
@@ -13,8 +14,12 @@ from . import (
     CONF_SENSORS,
     DOMAIN,
     ENTRY_DATA_DISCOVERED,
+    ENTRY_DATA_GATEWAY,
     get_configured_sensors,
+    get_ignored_sids,
 )
+
+CONF_IGNORE_DEVICE = "ignore_device"
 
 
 class MiioGatewayConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -84,6 +89,8 @@ class MiioGatewayConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         }
         if discovery_info[CONF_SENSOR_SID] in configured_sids:
             return self.async_abort(reason="already_configured_device")
+        if discovery_info[CONF_SENSOR_SID] in set(get_ignored_sids(entry)):
+            return self.async_abort(reason="device_ignored")
 
         return await self.async_step_confirm_discovery()
 
@@ -97,6 +104,10 @@ class MiioGatewayConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if entry is None:
                 return self.async_abort(reason="device_not_found")
 
+            if user_input[CONF_IGNORE_DEVICE]:
+                self._ignore_discovered_sid(entry, self._discovery_info[CONF_SENSOR_SID])
+                return self.async_abort(reason="device_ignored")
+
             sensors = list(get_configured_sensors(entry))
             sensors.append(
                 {
@@ -106,11 +117,12 @@ class MiioGatewayConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_SENSOR_RESTORE: user_input[CONF_SENSOR_RESTORE],
                 }
             )
-            self.hass.config_entries.async_update_entry(entry, options={CONF_SENSORS: sensors})
-
-            entry_data = self.hass.data.get(DOMAIN, {}).get(entry.entry_id)
-            if entry_data is not None:
-                entry_data.get(ENTRY_DATA_DISCOVERED, {}).pop(self._discovery_info[CONF_SENSOR_SID], None)
+            self.hass.config_entries.async_update_entry(
+                entry,
+                options=self._build_entry_options(entry, sensors=sensors),
+            )
+            self._remove_discovered_sid(entry.entry_id, self._discovery_info[CONF_SENSOR_SID])
+            self._mark_sid_known(entry.entry_id, self._discovery_info[CONF_SENSOR_SID])
 
             return self.async_abort(reason="device_added")
 
@@ -121,6 +133,7 @@ class MiioGatewayConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     vol.Required(CONF_SENSOR_CLASS, default=self._discovery_info.get(CONF_SENSOR_CLASS) or ""): str,
                     vol.Optional(CONF_SENSOR_NAME, default=""): str,
                     vol.Optional(CONF_SENSOR_RESTORE, default=False): bool,
+                    vol.Optional(CONF_IGNORE_DEVICE, default=False): bool,
                 }
             ),
             description_placeholders={
@@ -129,6 +142,43 @@ class MiioGatewayConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 "event": self._discovery_info.get("event") or "unknown",
             },
         )
+
+    def _build_entry_options(self, entry, *, sensors=None, ignored_sids=None):
+        """Merge updated sensors/ignored SIDs into entry options."""
+        options = dict(entry.options)
+        options[CONF_SENSORS] = list(get_configured_sensors(entry) if sensors is None else sensors)
+        options[CONF_IGNORED_SIDS] = list(get_ignored_sids(entry) if ignored_sids is None else ignored_sids)
+        return options
+
+    def _remove_discovered_sid(self, entry_id, sid):
+        """Remove a SID from the runtime discovered cache."""
+        entry_data = self.hass.data.get(DOMAIN, {}).get(entry_id)
+        if entry_data is not None:
+            entry_data.get(ENTRY_DATA_DISCOVERED, {}).pop(sid, None)
+
+    def _ignore_discovered_sid(self, entry, sid):
+        """Persist ignoring a discovered SID and clear it from pending discovery."""
+        ignored_sids = set(get_ignored_sids(entry))
+        ignored_sids.add(sid)
+        self.hass.config_entries.async_update_entry(
+            entry,
+            options=self._build_entry_options(entry, ignored_sids=sorted(ignored_sids)),
+        )
+        self._remove_discovered_sid(entry.entry_id, sid)
+
+        entry_data = self.hass.data.get(DOMAIN, {}).get(entry.entry_id)
+        if entry_data is not None:
+            gateway = entry_data.get(ENTRY_DATA_GATEWAY)
+            if gateway is not None:
+                gateway.append_ignored_sid(sid)
+
+    def _mark_sid_known(self, entry_id, sid):
+        """Mark a just-configured SID as known until the reload completes."""
+        entry_data = self.hass.data.get(DOMAIN, {}).get(entry_id)
+        if entry_data is not None:
+            gateway = entry_data.get(ENTRY_DATA_GATEWAY)
+            if gateway is not None:
+                gateway.append_known_sid(sid)
 
 
 class MiioGatewayOptionsFlow(config_entries.OptionsFlow):
@@ -144,6 +194,7 @@ class MiioGatewayOptionsFlow(config_entries.OptionsFlow):
         menu_options = []
         if self._get_discovered_devices():
             menu_options.append("add_discovered_device")
+            menu_options.append("ignore_discovered_device")
         if list(get_configured_sensors(self.config_entry)):
             menu_options.append("remove_configured_device")
 
@@ -197,7 +248,9 @@ class MiioGatewayOptionsFlow(config_entries.OptionsFlow):
                     CONF_SENSOR_RESTORE: user_input[CONF_SENSOR_RESTORE],
                 }
             )
-            return self.async_create_entry(data={CONF_SENSORS: sensors})
+            self._pop_discovered_sid(self._selected_sid)
+            self._mark_sid_known(self._selected_sid)
+            return self.async_create_entry(data=self._build_options(sensors=sensors))
 
         return self.async_show_form(
             step_id="configure_discovered_device",
@@ -215,6 +268,35 @@ class MiioGatewayOptionsFlow(config_entries.OptionsFlow):
             },
         )
 
+    # --------------------------------------------------------------- ignore
+
+    async def async_step_ignore_discovered_device(self, user_input=None):
+        """Choose a discovered device to ignore."""
+        discovered = self._get_discovered_devices()
+        if not discovered:
+            return self.async_abort(reason="no_discovered_devices")
+
+        if user_input is not None:
+            sid_to_ignore = user_input[CONF_SENSOR_SID]
+            ignored_sids = set(get_ignored_sids(self.config_entry))
+            ignored_sids.add(sid_to_ignore)
+            self._pop_discovered_sid(sid_to_ignore)
+            self._mark_sid_ignored(sid_to_ignore)
+            return self.async_create_entry(
+                data=self._build_options(ignored_sids=sorted(ignored_sids))
+            )
+
+        choices = {
+            sid: f"{sid}  —  {info.get('model') or 'unknown model'}"
+            for sid, info in discovered.items()
+        }
+        return self.async_show_form(
+            step_id="ignore_discovered_device",
+            data_schema=vol.Schema({
+                vol.Required(CONF_SENSOR_SID): vol.In(choices),
+            }),
+        )
+
     # ----------------------------------------------------------------- remove
 
     async def async_step_remove_configured_device(self, user_input=None):
@@ -226,7 +308,7 @@ class MiioGatewayOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             sid_to_remove = user_input[CONF_SENSOR_SID]
             updated = [s for s in sensors if s.get(CONF_SENSOR_SID) != sid_to_remove]
-            return self.async_create_entry(data={CONF_SENSORS: updated})
+            return self.async_create_entry(data=self._build_options(sensors=updated))
 
         choices = {}
         for s in sensors:
@@ -251,8 +333,45 @@ class MiioGatewayOptionsFlow(config_entries.OptionsFlow):
             cfg.get(CONF_SENSOR_SID)
             for cfg in get_configured_sensors(self.config_entry)
         }
+        ignored_sids = set(get_ignored_sids(self.config_entry))
         return {
             sid: info
             for sid, info in discovered.items()
-            if sid not in configured_sids
+            if sid not in configured_sids and sid not in ignored_sids
         }
+
+    def _build_options(self, *, sensors=None, ignored_sids=None):
+        """Build updated options while preserving unrelated keys."""
+        options = dict(self.config_entry.options)
+        options[CONF_SENSORS] = list(get_configured_sensors(self.config_entry) if sensors is None else sensors)
+        options[CONF_IGNORED_SIDS] = list(get_ignored_sids(self.config_entry) if ignored_sids is None else ignored_sids)
+        return options
+
+    def _pop_discovered_sid(self, sid):
+        """Remove a SID from the runtime discovered cache."""
+        entry_data = self.hass.data.get(DOMAIN, {}).get(self.config_entry.entry_id)
+        if entry_data is None:
+            return
+
+        entry_data.get(ENTRY_DATA_DISCOVERED, {}).pop(sid, None)
+
+    def _mark_sid_known(self, sid):
+        """Mark a just-configured SID as known until the reload completes."""
+        entry_data = self.hass.data.get(DOMAIN, {}).get(self.config_entry.entry_id)
+        if entry_data is None:
+            return
+
+        gateway = entry_data.get(ENTRY_DATA_GATEWAY)
+        if gateway is not None:
+            gateway.append_known_sid(sid)
+
+    def _mark_sid_ignored(self, sid):
+        """Suppress future prompts for an ignored SID immediately."""
+        entry_data = self.hass.data.get(DOMAIN, {}).get(self.config_entry.entry_id)
+        if entry_data is None:
+            return
+
+        gateway = entry_data.get(ENTRY_DATA_GATEWAY)
+        if gateway is not None:
+            gateway.append_ignored_sid(sid)
+

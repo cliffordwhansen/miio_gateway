@@ -16,7 +16,8 @@
         "data": {
           "class": "Device Class (e.g. motion, button, door, leak)",
           "friendly_name": "Friendly Name (optional)",
-          "restore": "Restore state on restart"
+          "restore": "Restore state on restart",
+          "ignore_device": "Ignore this device"
         }
       }
     },
@@ -24,7 +25,8 @@
       "already_configured": "This gateway is already configured.",
       "yaml_only": "This integration can only be set up via the UI or configuration.yaml.",
       "already_configured_device": "This child device is already configured.",
-      "device_added": "The discovered device has been added."
+      "device_added": "The discovered device has been added.",
+      "device_ignored": "This child device has been ignored."
     }
   },
   "options": {
@@ -33,6 +35,7 @@
         "title": "Miio Gateway",
         "menu_options": {
           "add_discovered_device": "Add a discovered device",
+          "ignore_discovered_device": "Ignore a discovered device",
           "remove_configured_device": "Remove a configured device"
         }
       },
@@ -50,6 +53,13 @@
           "class": "Device Class (e.g. motion, button, door, leak)",
           "friendly_name": "Friendly Name (optional)",
           "restore": "Restore state on restart"
+        }
+      },
+      "ignore_discovered_device": {
+        "title": "Ignore Discovered Device",
+        "description": "Select a discovered device to ignore. Ignored devices will no longer appear as pending additions.",
+        "data": {
+          "sid": "Device SID"
         }
       },
       "remove_configured_device": {
